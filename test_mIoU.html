@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TF.js 分割模型 mIoU 测试</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+        line-height: 1.6;
+        padding: 20px;
+        max-width: 800px;
+        margin: 0 auto;
+        background-color: #f4f4f9;
+      }
+      h1,
+      h2 {
+        color: #333;
+      }
+      #status {
+        padding: 10px;
+        background-color: #e3f2fd;
+        border-left: 5px solid #2196f3;
+        margin-bottom: 20px;
+      }
+      #results {
+        padding: 10px;
+        background-color: #e8f5e9;
+        border-left: 5px solid #4caf50;
+        display: none;
+      }
+      #results p {
+        margin: 5px 0;
+      }
+      .progress-bar {
+        width: 100%;
+        background-color: #ddd;
+        border-radius: 5px;
+      }
+      .progress-bar-inner {
+        width: 0%;
+        height: 20px;
+        background-color: #4caf50;
+        text-align: center;
+        line-height: 20px;
+        color: white;
+        border-radius: 5px;
+        transition: width 0.3s;
+      }
+      code {
+        background-color: #eee;
+        padding: 2px 4px;
+        border-radius: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>TensorFlow.js 分割模型 mIoU 测试</h1>
+    <p>本页面将加载您的 TF.js 分割模型，并在指定的数据集上评估其 mIoU 性能。</p>
+    <p>
+      模型输入尺寸: <code>[1, 3, 256, 144]</code>, 输出尺寸:
+      <code>[1, 2, 256, 144]</code>
+    </p>
+    <p>
+      当前 TensorFlow.js 后端:
+      <code id="backend-name">detecting…</code>
+    </p>
+    <!-- ===== 控制面板：数据集选择 & 阈值设定 ===== -->
+    <div id="controls" style="margin-bottom: 20px">
+      <label>
+        选择数据集目录：
+        <!-- 允许整目录选择；Chrome 及多数 Chromium 内核浏览器支持 -->
+        <input
+          type="file"
+          id="dataset-input"
+          webkitdirectory
+          directory
+          multiple
+        />
+      </label>
+      <label style="margin-left: 16px">
+        阈值：
+        <input
+          type="number"
+          id="threshold-input"
+          value="0.6"
+          step="0.05"
+          min="0"
+          max="1"
+          style="width: 70px"
+        />
+      </label>
+      <button id="start-btn" disabled style="margin-left: 16px">
+        开始测试
+      </button>
+    </div>
+
+    <div id="status">正在初始化...</div>
+
+    <div id="progress-container" style="display: none">
+      <h2>测试进度</h2>
+      <div class="progress-bar">
+        <div id="progress-bar-inner" class="progress-bar-inner">0%</div>
+      </div>
+    </div>
+
+    <div id="results">
+      <h2>测试结果</h2>
+      <p>
+        <strong>最终 mIoU: <span id="miou-value"></span></strong>
+      </p>
+      <p>平均 IoU (Class 0 - 背景): <span id="iou-class-0"></span></p>
+      <p>平均 IoU (Class 1 - 前景): <span id="iou-class-1"></span></p>
+      <p>总计处理图片数量: <span id="total-images"></span></p>
+      <p>平均推理时间/张: <span id="avg-infer-time"></span> ms</p>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+
+    <script>
+      // --- 用户配置区 ---
+      // 模型路径与输入尺寸
+      const MODEL_PATH = "./models/tfjs_model/model.json";
+      const INPUT_WIDTH = 144;
+      const INPUT_HEIGHT = 256;
+      // 数据集文件列表将在用户选择目录后动态生成
+      let DATASET_FILES = []; // 保存 basename 列表
+      const FRAME_MAP = new Map(); // basename -> File
+      const MASK_MAP = new Map(); // basename -> File
+      // -----------------
+      // 显示当前后端信息
+      tf.ready().then(() => {
+        const backend = tf.getBackend(); // 'webgl', 'cpu', 'wasm', 'webgpu'...
+        document.getElementById("backend-name").innerText = backend;
+
+        // 额外在控制台输出硬件提示
+        console.log(`🚀 Using TensorFlow.js backend: ${backend}`);
+        if (backend === "webgl" || backend === "webgpu") {
+          console.log("✅ 推理主要在 GPU 上执行");
+        } else {
+          console.log("ℹ️ 推理在 CPU / WebAssembly 上执行");
+        }
+      });
+
+      const statusDiv = document.getElementById("status");
+      const resultsDiv = document.getElementById("results");
+      const progressContainer = document.getElementById("progress-container");
+      const progressBarInner = document.getElementById("progress-bar-inner");
+
+      const datasetInput = document.getElementById("dataset-input");
+      const startBtn = document.getElementById("start-btn");
+      const thresholdInput = document.getElementById("threshold-input");
+
+      // 目录选择后，扫描 frames/ 与 masks_binary/ 子目录，构建文件映射
+      datasetInput.addEventListener("change", () => {
+        DATASET_FILES.length = 0;
+        FRAME_MAP.clear();
+        MASK_MAP.clear();
+
+        for (const file of datasetInput.files) {
+          const rel = file.webkitRelativePath || file.name;
+
+          if (rel.includes("frames/") && rel.endsWith(".jpg")) {
+            const base = file.name.replace(/\.jpg$/i, "");
+            FRAME_MAP.set(base, file);
+          } else if (rel.includes("masks_binary/") && rel.endsWith(".png")) {
+            const base = file.name.replace(/\.png$/i, "");
+            MASK_MAP.set(base, file);
+          }
+        }
+
+        // 仅保留同时拥有 frame & mask 的样本
+        for (const [base, frame] of FRAME_MAP) {
+          if (MASK_MAP.has(base)) DATASET_FILES.push(base);
+        }
+
+        if (DATASET_FILES.length === 0) {
+          statusDiv.innerText =
+            "⚠️ 所选目录中未找到有效数据集（需包含 frames/ 与 masks_binary/）。";
+          startBtn.disabled = true;
+        } else {
+          statusDiv.innerText = `✅ 已识别到 ${DATASET_FILES.length} 张有效图片，点击「开始测试」以运行。`;
+          startBtn.disabled = false;
+        }
+      });
+
+      // 点击按钮后启动主流程
+      startBtn.addEventListener("click", () => {
+        startBtn.disabled = true; // 防止重复点击
+        main().finally(() => {
+          startBtn.disabled = false;
+        });
+      });
+
+      // 主函数
+      async function main() {
+        if (DATASET_FILES.length === 0) {
+          statusDiv.innerText = "错误：DATASET_FILES 列表为空。请检查代码。";
+          statusDiv.style.backgroundColor = "#ffcdd2";
+          statusDiv.style.borderColor = "#f44336";
+          return;
+        }
+
+        statusDiv.innerText = "正在加载 TFJS 模型...";
+        const model = await tf.loadGraphModel(MODEL_PATH);
+        statusDiv.innerText = "模型加载成功!";
+        // 预热模型
+        const warmupTensor = tf.zeros([1, 3, INPUT_HEIGHT, INPUT_WIDTH]);
+        model.predict(warmupTensor).dispose();
+        warmupTensor.dispose();
+        console.log("模型已加载并预热。");
+
+        progressContainer.style.display = "block";
+
+        const iouScoresClass0 = [];
+        const iouScoresClass1 = [];
+        const inferenceTimes = [];
+
+        for (let i = 0; i < DATASET_FILES.length; i++) {
+          const baseName = DATASET_FILES[i];
+          const frameFile = FRAME_MAP.get(baseName);
+          const maskFile = MASK_MAP.get(baseName);
+          const progress = ((i + 1) / DATASET_FILES.length) * 100;
+
+          statusDiv.innerText = `正在处理图片 ${i + 1} / ${
+            DATASET_FILES.length
+          }: ${baseName}.jpg`;
+          progressBarInner.style.width = `${progress}%`;
+          progressBarInner.innerText = `${Math.round(progress)}%`;
+
+          try {
+            const { iou0, iou1, timeMs } = await processSingleImage(
+              model,
+              frameFile,
+              maskFile
+            );
+
+            if (!isNaN(iou0)) iouScoresClass0.push(iou0);
+            if (!isNaN(iou1)) iouScoresClass1.push(iou1);
+
+            inferenceTimes.push(timeMs);
+
+            console.log(
+              `Image ${baseName}: IoU Class 0 = ${iou0}, IoU Class 1 = ${iou1}`
+            );
+          } catch (error) {
+            console.error(`处理图片 ${baseName} 时发生错误: `, error);
+            statusDiv.innerText = `处理图片 ${baseName} 时出错: ${error.message}. 请检查控制台。`;
+          }
+        }
+
+        calculateAndDisplayResults(
+          iouScoresClass0,
+          iouScoresClass1,
+          inferenceTimes
+        );
+        model.dispose();
+      }
+
+      // 处理单张图片：加载、预处理、推理、计算IoU
+      async function processSingleImage(model, frameFile, maskFile) {
+        const frameTensorUnprocessed = await loadImageToTensor(frameFile);
+        const maskTensorUnprocessed = await loadImageToTensor(maskFile, true);
+
+        let iou0_val_num = NaN;
+        let iou1_val_num = NaN;
+        let inferenceTime = 0;
+
+        tf.tidy(() => {
+          const t0 = performance.now();
+          const preprocessedFrame = preprocessInput(frameTensorUnprocessed);
+          const prediction = model.predict(preprocessedFrame); // Shape: [1, 2, H, W]
+
+          // --- 主要修改区域 ---
+          // 1. 将类别维度(axis 1)换到最后一个维度，以适应tf.softmax的要求
+          //    原始形状: [Batch, Class, Height, Width] -> [1, 2, 256, 144]
+          //    目标形状: [Batch, Height, Width, Class] -> [1, 256, 144, 2]
+          const transposedPrediction = prediction.transpose([0, 2, 3, 1]);
+
+          // 2. 应用Softmax (默认在最后一个维度上操作)
+          const probabilitiesTransposed = transposedPrediction.softmax(); // Shape: [1, H, W, 2]
+
+          // 3. 提取类别1（前景）的概率图
+          //    在最后一个维度(类别维度)上slice出索引为1的部分
+          //    slice at [batch_start, height_start, width_start, class_index_start]
+          //    size     [batch_size,  height_size,  width_size,  num_classes_to_slice]
+          const class1Probs = probabilitiesTransposed.slice(
+            [0, 0, 0, 1],
+            [1, -1, -1, 1]
+          ); // Shape: [1, H, W, 1]
+
+          // 4. 与 0.5 阈值比较，生成布尔掩码
+          const threshold = tf.scalar(parseFloat(thresholdInput.value) || 0.6);
+          // .squeeze() 会移除所有大小为1的维度，这里会移除batch和最后一个channel维度, 变为 [H, W]
+          const predictionMask = class1Probs
+            .greater(threshold)
+            .squeeze()
+            .cast("int32");
+          // --- 修改结束 ---
+
+          const groundTruthMask = preprocessMask(maskTensorUnprocessed);
+          const iou0_tensor = calculateIoUForClass(
+            predictionMask,
+            groundTruthMask,
+            0
+          );
+          const iou1_tensor = calculateIoUForClass(
+            predictionMask,
+            groundTruthMask,
+            1
+          );
+
+          iou0_val_num = iou0_tensor.dataSync()[0];
+          iou1_val_num = iou1_tensor.dataSync()[0];
+          const t1 = performance.now();
+          inferenceTime = t1 - t0;
+        });
+
+        frameTensorUnprocessed.dispose();
+        maskTensorUnprocessed.dispose();
+
+        return {
+          iou0: iou0_val_num,
+          iou1: iou1_val_num,
+          timeMs: inferenceTime,
+        };
+      }
+
+      function loadImageToTensor(source, isMask = false) {
+        return new Promise((resolve, reject) => {
+          const img = new Image();
+          img.crossOrigin = "anonymous";
+
+          // 支持 File / Blob 或 URL 字符串
+          if (source instanceof File || source instanceof Blob) {
+            const url = URL.createObjectURL(source);
+            img.src = url;
+            img.onload = () => {
+              URL.revokeObjectURL(url);
+            };
+          } else {
+            img.src = source;
+          }
+
+          img.onload = () => {
+            const channels = isMask ? 1 : 3;
+            const tensor = tf.browser.fromPixels(img, channels);
+            resolve(tensor);
+          };
+          img.onerror = (err) => {
+            console.error("加载图片失败:", err);
+            reject(new Error("无法加载图片。"));
+          };
+        });
+      }
+
+      function preprocessInput(tensor) {
+        const resized = tf.image.resizeBilinear(tensor, [
+          INPUT_HEIGHT,
+          INPUT_WIDTH,
+        ]);
+        const normalized = resized.div(255.0);
+        const transposed = normalized.transpose([2, 0, 1]);
+        const batched = transposed.expandDims(0);
+        return batched;
+      }
+
+      function preprocessMask(tensor) {
+        const resized = tf.image.resizeBilinear(tensor, [
+          INPUT_HEIGHT,
+          INPUT_WIDTH,
+        ]);
+        return resized.round().cast("int32").squeeze();
+      }
+
+      function calculateIoUForClass(predMask, gtMask, classId) {
+        const epsilon = tf.scalar(1e-7);
+        const pred_is_class = predMask.equal(classId);
+        const gt_is_class = gtMask.equal(classId);
+        const tp = tf.logicalAnd(pred_is_class, gt_is_class).sum();
+        const fp = tf.logicalAnd(pred_is_class, gt_is_class.logicalNot()).sum();
+        const fn = tf.logicalAnd(pred_is_class.logicalNot(), gt_is_class).sum();
+        const union = tp.add(fp).add(fn);
+        return tp.div(union.add(epsilon));
+      }
+
+      function calculateAndDisplayResults(iouScores0, iouScores1, inferTimes) {
+        const sum = (arr) => arr.reduce((acc, val) => acc + val, 0);
+        const avgIou0 =
+          iouScores0.length > 0 ? sum(iouScores0) / iouScores0.length : 0;
+        const avgIou1 =
+          iouScores1.length > 0 ? sum(iouScores1) / iouScores1.length : 0;
+        const mIoU = (avgIou0 + avgIou1) / 2;
+        const avgTime =
+          inferTimes.length > 0 ? sum(inferTimes) / inferTimes.length : 0;
+
+        statusDiv.style.display = "none";
+        progressContainer.style.display = "none";
+        resultsDiv.style.display = "block";
+
+        document.getElementById("miou-value").innerText = mIoU.toFixed(4);
+        document.getElementById("iou-class-0").innerText = avgIou0.toFixed(4);
+        document.getElementById("iou-class-1").innerText = avgIou1.toFixed(4);
+        document.getElementById("total-images").innerText =
+          DATASET_FILES.length;
+        document.getElementById("avg-infer-time").innerText =
+          avgTime.toFixed(2);
+
+        console.log("--- 测试完成 ---");
+        console.log(
+          `处理图片数量 (计入有效 IoU): Class 0=${iouScores0.length}, Class 1=${iouScores1.length}`
+        );
+        console.log(`平均 IoU (Class 0 - 背景): ${avgIou0.toFixed(4)}`);
+        console.log(`平均 IoU (Class 1 - 前景): ${avgIou1.toFixed(4)}`);
+        console.log(`最终 mIoU: ${mIoU.toFixed(4)}`);
+        console.log(`平均推理时间: ${avgTime.toFixed(2)} ms/张`);
+      }
+    </script>
+  </body>
+</html>

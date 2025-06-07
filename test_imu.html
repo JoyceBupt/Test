@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, user-scalable=no"
+    />
+    <title>摄像头与IMU数据采集工具</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+        margin: 0;
+        padding: 0;
+        background-color: #f0f2f5;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        height: 100vh;
+        box-sizing: border-box;
+      }
+      #video-container {
+        position: relative;
+        width: 100%;
+        max-width: 640px;
+        margin-top: 10px;
+        background-color: #000;
+      }
+      #video {
+        width: 100%;
+        height: auto;
+        display: block;
+      }
+      #controls {
+        padding: 15px;
+        display: flex;
+        gap: 15px;
+        justify-content: center;
+        flex-wrap: wrap;
+      }
+      button {
+        font-size: 16px;
+        padding: 12px 24px;
+        border-radius: 8px;
+        border: none;
+        cursor: pointer;
+        color: white;
+        transition: background-color 0.3s;
+      }
+      #startButton {
+        background-color: #28a745;
+      }
+      #startButton:disabled {
+        background-color: #888;
+      }
+      #stopButton {
+        background-color: #dc3545;
+      }
+      #stopButton:disabled {
+        background-color: #888;
+      }
+      #status {
+        margin: 10px;
+        padding: 10px;
+        background-color: #fff;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        width: 90%;
+        max-width: 620px;
+        text-align: center;
+        font-size: 14px;
+      }
+      .imu-data {
+        font-family: monospace;
+        font-size: 12px;
+        color: #333;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="video-container">
+      <video id="video" playsinline autoplay muted></video>
+    </div>
+
+    <div id="controls">
+      <button id="startButton">开始采集</button>
+      <button id="stopButton" disabled>停止并下载</button>
+    </div>
+
+    <div id="status">
+      <p id="info-text">请点击“开始采集”按钮</p>
+      <div id="imu-display" class="imu-data">IMU: 等待数据...</div>
+    </div>
+
+    <script>
+      // --- 配置项 ---
+      const FRAMES_TO_SKIP = 30; // 每隔30帧保存一次
+
+      // --- DOM 元素 ---
+      const video = document.getElementById("video");
+      const startButton = document.getElementById("startButton");
+      const stopButton = document.getElementById("stopButton");
+      const infoText = document.getElementById("info-text");
+      const imuDisplay = document.getElementById("imu-display");
+
+      // --- 全局变量 ---
+      let stream;
+      let isCapturing = false;
+      let frameCount = 0;
+      let animationFrameId;
+      let capturedData = [];
+      let latestImuData = { alpha: null, beta: null, gamma: null };
+
+      // --- IMU 传感器事件监听 ---
+      function handleOrientation(event) {
+        latestImuData = {
+          alpha: event.alpha,
+          beta: event.beta,
+          gamma: event.gamma,
+        };
+        imuDisplay.textContent = `IMU: α=${event.alpha?.toFixed(
+          2
+        )}, β=${event.beta?.toFixed(2)}, γ=${event.gamma?.toFixed(2)}`;
+      }
+
+      // --- 主处理循环 ---
+      function processLoop() {
+        if (!isCapturing) return;
+
+        frameCount++;
+        if (frameCount % FRAMES_TO_SKIP === 0) {
+          captureFrameAndData();
+        }
+        animationFrameId = requestAnimationFrame(processLoop);
+      }
+
+      // --- 捕获帧和数据 ---
+      function captureFrameAndData() {
+        const canvas = document.createElement("canvas");
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        const context = canvas.getContext("2d");
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        const timestamp = Date.now();
+        const filename = `frame_${timestamp}.jpg`;
+
+        canvas.toBlob(
+          (blob) => {
+            capturedData.push({
+              timestamp: timestamp,
+              filename: filename,
+              imageBlob: blob,
+              imu: { ...latestImuData }, // 复制当前IMU数据
+            });
+            infoText.textContent = `采集中... 已捕获 ${capturedData.length} 帧`;
+          },
+          "image/jpeg",
+          0.9
+        ); // 保存为jpeg格式，质量90%
+      }
+
+      // --- 开始采集 ---
+      startButton.addEventListener("click", async () => {
+        try {
+          // 1. 请求IMU权限 (特别是为iOS)
+          if (
+            typeof DeviceOrientationEvent !== "undefined" &&
+            typeof DeviceOrientationEvent.requestPermission === "function"
+          ) {
+            const permission = await DeviceOrientationEvent.requestPermission();
+            if (permission !== "granted") {
+              alert("需要IMU传感器权限才能继续。");
+              return;
+            }
+          }
+          window.addEventListener("deviceorientation", handleOrientation);
+
+          // 2. 请求摄像头权限
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              facingMode: "environment", // 优先使用后置摄像头
+            },
+          });
+          video.srcObject = stream;
+          await video.play();
+
+          // 3. 更新UI和状态
+          isCapturing = true;
+          startButton.disabled = true;
+          stopButton.disabled = false;
+          infoText.textContent = "摄像头已启动，开始采集...";
+
+          // 4. 启动处理循环
+          animationFrameId = requestAnimationFrame(processLoop);
+        } catch (err) {
+          console.error("启动失败:", err);
+          alert(`启动失败: ${err.message}`);
+          infoText.textContent = `错误: ${err.message}`;
+        }
+      });
+
+      // --- 停止采集 ---
+      stopButton.addEventListener("click", () => {
+        isCapturing = false;
+        cancelAnimationFrame(animationFrameId);
+
+        // 停止摄像头
+        if (stream) {
+          stream.getTracks().forEach((track) => track.stop());
+        }
+        video.srcObject = null;
+
+        // 移除IMU监听
+        window.removeEventListener("deviceorientation", handleOrientation);
+
+        // 更新UI
+        startButton.disabled = false;
+        stopButton.disabled = true;
+        infoText.textContent = `采集结束，共捕获 ${capturedData.length} 帧。正在生成ZIP文件...`;
+        imuDisplay.textContent = "IMU: 已停止";
+
+        // 打包并下载数据
+        if (capturedData.length > 0) {
+          packageAndDownload();
+        } else {
+          infoText.textContent = "没有捕获到任何数据。";
+          capturedData = []; // 清空数组
+        }
+      });
+
+      // --- 打包并下载ZIP ---
+      async function packageAndDownload() {
+        const zip = new JSZip();
+        const outputFolder = zip.folder("output");
+
+        // 1. 创建 log.txt 文件
+        let logContent = "Timestamp,Filename,Alpha,Beta,Gamma\n";
+        capturedData.forEach((data) => {
+          logContent += `${data.timestamp},${data.filename},${
+            data.imu.alpha?.toFixed(4) || "N/A"
+          },${data.imu.beta?.toFixed(4) || "N/A"},${
+            data.imu.gamma?.toFixed(4) || "N/A"
+          }\n`;
+          // 将图片添加到zip中
+          outputFolder.file(data.filename, data.imageBlob);
+        });
+        outputFolder.file("log.txt", logContent);
+
+        // 2. 生成ZIP文件
+        infoText.textContent = "正在压缩ZIP文件，请稍候...";
+        const zipBlob = await zip.generateAsync({
+          type: "blob",
+          compression: "DEFLATE",
+          compressionOptions: {
+            level: 9,
+          },
+        });
+
+        // 3. 触发下载
+        const downloadLink = document.createElement("a");
+        downloadLink.href = URL.createObjectURL(zipBlob);
+        downloadLink.download = `capture_data_${Date.now()}.zip`;
+        document.body.appendChild(downloadLink);
+        downloadLink.click();
+        document.body.removeChild(downloadLink);
+
+        infoText.textContent = "ZIP文件已下载！请点击“开始采集”以重新开始。";
+
+        // 4. 清理数据
+        capturedData = [];
+        frameCount = 0;
+      }
+    </script>
+  </body>
+</html>
