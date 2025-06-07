@@ -1,0 +1,1028 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <title>图像分割演示(批量处理版)</title>
+
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.12.0"></script>
+
+    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+
+        max-width: 1200px;
+
+        margin: 0 auto;
+
+        padding: 20px;
+      }
+
+      .container {
+        display: flex;
+
+        flex-wrap: nowrap;
+
+        gap: 20px;
+
+        justify-content: center;
+
+        align-items: flex-start;
+      }
+
+      .image-container {
+        flex: 1;
+
+        display: flex;
+
+        flex-direction: column;
+
+        align-items: center;
+      }
+
+      canvas {
+        max-width: 100%;
+
+        height: auto;
+
+        margin-top: 10px;
+
+        border: 1px solid #ddd;
+      }
+
+      .controls {
+        margin: 20px 0;
+
+        padding: 15px;
+
+        background: #f5f5f5;
+
+        border-radius: 5px;
+      }
+
+      button {
+        padding: 8px 15px;
+
+        background: #4caf50;
+
+        color: white;
+
+        border: none;
+
+        border-radius: 4px;
+
+        cursor: pointer;
+
+        margin-right: 10px;
+
+        margin-bottom: 10px;
+      }
+
+      button:hover {
+        background: #45a049;
+      }
+
+      button:disabled {
+        background: #cccccc;
+
+        cursor: not-allowed;
+      }
+
+      input[type="range"] {
+        width: 200px;
+      }
+
+      #progressContainer {
+        margin-top: 20px;
+
+        display: none;
+      }
+
+      progress {
+        width: 100%;
+
+        height: 20px;
+      }
+
+      .batch-results {
+        margin-top: 20px;
+
+        width: 100%;
+      }
+
+      .result-item {
+        display: flex;
+
+        align-items: center;
+
+        margin-bottom: 10px;
+
+        padding: 10px;
+
+        background-color: #f9f9f9;
+
+        border-radius: 4px;
+      }
+
+      .result-item img {
+        max-width: 100px;
+
+        max-height: 100px;
+
+        margin-right: 15px;
+
+        border: 1px solid #ddd;
+      }
+
+      .result-info {
+        flex: 1;
+      }
+
+      .result-actions button {
+        margin-left: 10px;
+      }
+
+      .tab-buttons {
+        display: flex;
+
+        margin-bottom: 20px;
+      }
+
+      .tab-button {
+        padding: 10px 20px;
+
+        background: #e0e0e0;
+
+        border: none;
+
+        cursor: pointer;
+
+        border-radius: 4px 4px 0 0;
+
+        margin-right: 5px;
+      }
+
+      .tab-button.active {
+        background: #4caf50;
+
+        color: white;
+      }
+
+      .tab-content {
+        display: none;
+      }
+
+      .tab-content.active {
+        display: block;
+      }
+
+      #batchStatus {
+        margin-top: 10px;
+
+        font-weight: bold;
+      }
+    </style>
+  </head>
+
+  <body>
+    <h1>图像分割演示(批量处理版)</h1>
+
+    <div class="tab-buttons">
+      <button class="tab-button active" data-tab="singleMode">单张处理</button>
+
+      <button class="tab-button" data-tab="batchMode">批量处理</button>
+    </div>
+
+    <div class="controls">
+      <div>
+        <label for="thresholdSlider"
+          >阈值: <span id="thresholdValue">0.5</span></label
+        >
+
+        <input
+          type="range"
+          id="thresholdSlider"
+          min="0"
+          max="1"
+          step="0.01"
+          value="0.5"
+        />
+      </div>
+    </div>
+
+    <!-- 单张处理模式 -->
+
+    <div id="singleMode" class="tab-content active">
+      <div class="controls">
+        <input type="file" id="imageUpload" accept="image/*" />
+
+        <button id="runButton" disabled>运行分割</button>
+      </div>
+
+      <div class="container">
+        <div class="image-container">
+          <h3>原始图像</h3>
+
+          <canvas id="inputCanvas"></canvas>
+        </div>
+
+        <div class="image-container">
+          <h3>分割结果</h3>
+
+          <canvas id="outputCanvas"></canvas>
+        </div>
+      </div>
+
+      <div class="controls">
+        <button id="downloadSingleResult" disabled>下载分割结果</button>
+      </div>
+    </div>
+
+    <!-- 批量处理模式 -->
+
+    <div id="batchMode" class="tab-content">
+      <div class="controls">
+        <input
+          type="file"
+          id="folderUpload"
+          webkitdirectory
+          directory
+          multiple
+        />
+
+        <button id="runBatchButton" disabled>批量处理</button>
+
+        <button id="downloadAllButton" disabled>打包下载所有结果</button>
+
+        <div id="progressContainer">
+          <p>处理进度: <span id="progressText">0/0</span></p>
+
+          <progress id="progressBar" value="0" max="100"></progress>
+
+          <p id="batchStatus">准备就绪</p>
+        </div>
+      </div>
+
+      <div class="batch-results" id="batchResults">
+        <!-- 批处理结果将在这里动态显示 -->
+      </div>
+    </div>
+
+    <script>
+      // 全局变量
+
+      let model;
+
+      let threshold = 0.5;
+
+      let processedImages = [];
+
+      const supportedImageTypes = [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/bmp",
+        "image/webp",
+      ];
+
+      // DOM 元素
+
+      const imageUpload = document.getElementById("imageUpload");
+
+      const folderUpload = document.getElementById("folderUpload");
+
+      const runButton = document.getElementById("runButton");
+
+      const runBatchButton = document.getElementById("runBatchButton");
+
+      const downloadSingleResult = document.getElementById(
+        "downloadSingleResult"
+      );
+
+      const downloadAllButton = document.getElementById("downloadAllButton");
+
+      const inputCanvas = document.getElementById("inputCanvas");
+
+      const outputCanvas = document.getElementById("outputCanvas");
+
+      const thresholdSlider = document.getElementById("thresholdSlider");
+
+      const thresholdValue = document.getElementById("thresholdValue");
+
+      const progressBar = document.getElementById("progressBar");
+
+      const progressText = document.getElementById("progressText");
+
+      const progressContainer = document.getElementById("progressContainer");
+
+      const batchResults = document.getElementById("batchResults");
+
+      const batchStatus = document.getElementById("batchStatus");
+
+      // 标签页切换逻辑
+
+      const tabButtons = document.querySelectorAll(".tab-button");
+
+      const tabContents = document.querySelectorAll(".tab-content");
+
+      tabButtons.forEach((button) => {
+        button.addEventListener("click", () => {
+          const tabId = button.dataset.tab;
+
+          // 更新按钮状态
+
+          tabButtons.forEach((btn) => btn.classList.remove("active"));
+
+          button.classList.add("active");
+
+          // 更新内容显示
+
+          tabContents.forEach((content) => {
+            content.classList.remove("active");
+
+            if (content.id === tabId) {
+              content.classList.add("active");
+            }
+          });
+        });
+      });
+
+      // 初始化
+
+      async function init() {
+        try {
+          // 加载模型 - 替换为实际模型路径
+
+          console.log("正在加载模型...");
+
+          model = await tf.loadGraphModel("models/tfjs_model/model.json");
+
+          console.log("模型加载成功");
+
+          runButton.disabled = false;
+
+          runBatchButton.disabled = false;
+        } catch (error) {
+          console.error("模型加载失败:", error);
+
+          alert("模型加载失败，请检查控制台获取详细信息");
+        }
+      }
+
+      // 处理单个图像上传
+
+      imageUpload.addEventListener("change", (e) => {
+        if (e.target.files && e.target.files[0]) {
+          const reader = new FileReader();
+
+          reader.onload = (event) => {
+            const img = new Image();
+
+            img.onload = () => {
+              // 设置画布大小并绘制原始图像
+
+              inputCanvas.width = img.width;
+
+              inputCanvas.height = img.height;
+
+              outputCanvas.width = img.width;
+
+              outputCanvas.height = img.height;
+
+              const ctx = inputCanvas.getContext("2d");
+
+              ctx.drawImage(img, 0, 0);
+
+              // 重置下载按钮状态
+
+              downloadSingleResult.disabled = true;
+            };
+
+            img.src = event.target.result;
+          };
+
+          reader.readAsDataURL(e.target.files[0]);
+        }
+      });
+
+      // 处理文件夹上传
+
+      folderUpload.addEventListener("change", (e) => {
+        if (e.target.files && e.target.files.length > 0) {
+          // 过滤出图像文件
+
+          const imageFiles = Array.from(e.target.files).filter((file) =>
+            supportedImageTypes.includes(file.type)
+          );
+
+          if (imageFiles.length === 0) {
+            alert(
+              "未找到图像文件！请确保文件夹中包含支持的图像格式 (JPG, PNG, GIF, BMP, WEBP)"
+            );
+
+            return;
+          }
+
+          console.log(`找到 ${imageFiles.length} 个图像文件`);
+
+          batchStatus.textContent = `已准备处理 ${imageFiles.length} 个图像文件`;
+
+          // 清空之前的结果
+
+          processedImages = [];
+
+          batchResults.innerHTML = "";
+
+          // 启用批处理按钮
+
+          runBatchButton.disabled = false;
+
+          downloadAllButton.disabled = true;
+        }
+      });
+
+      // 阈值滑块
+
+      thresholdSlider.addEventListener("input", (e) => {
+        threshold = parseFloat(e.target.value);
+
+        thresholdValue.textContent = threshold.toFixed(2);
+      });
+
+      // 运行单张图像分割
+
+      runButton.addEventListener("click", async () => {
+        if (!model) {
+          alert("模型尚未加载完成");
+
+          return;
+        }
+
+        if (inputCanvas.width === 0) {
+          alert("请先上传图像");
+
+          return;
+        }
+
+        try {
+          await processImage(inputCanvas, outputCanvas);
+
+          // 启用下载按钮
+
+          downloadSingleResult.disabled = false;
+        } catch (error) {
+          console.error("分割过程出错:", error);
+
+          alert("分割失败，请检查控制台获取详细信息");
+        }
+      });
+
+      // 运行批量处理
+
+      runBatchButton.addEventListener("click", async () => {
+        if (!model) {
+          alert("模型尚未加载完成");
+
+          return;
+        }
+
+        if (folderUpload.files.length === 0) {
+          alert("请先选择文件夹");
+
+          return;
+        }
+
+        // 过滤出图像文件
+
+        const imageFiles = Array.from(folderUpload.files).filter((file) =>
+          supportedImageTypes.includes(file.type)
+        );
+
+        if (imageFiles.length === 0) {
+          alert("未找到图像文件！");
+
+          return;
+        }
+
+        // 清空之前的结果
+
+        processedImages = [];
+
+        batchResults.innerHTML = "";
+
+        // 显示和初始化进度条
+
+        progressContainer.style.display = "block";
+
+        progressBar.max = imageFiles.length;
+
+        progressBar.value = 0;
+
+        progressText.textContent = `0/${imageFiles.length}`;
+
+        batchStatus.textContent = "正在处理中...";
+
+        // 禁用按钮，避免重复处理
+
+        runBatchButton.disabled = true;
+
+        try {
+          for (let i = 0; i < imageFiles.length; i++) {
+            const file = imageFiles[i];
+
+            await processBatchImage(file, i + 1, imageFiles.length);
+
+            // 更新进度条
+
+            progressBar.value = i + 1;
+
+            progressText.textContent = `${i + 1}/${imageFiles.length}`;
+          }
+
+          // 处理完成后启用下载按钮
+
+          downloadAllButton.disabled = false;
+
+          batchStatus.textContent = "批量处理完成！";
+
+          runBatchButton.disabled = false;
+        } catch (error) {
+          console.error("批量处理过程出错:", error);
+
+          alert("批量处理失败，请检查控制台获取详细信息");
+
+          runBatchButton.disabled = false;
+
+          batchStatus.textContent = "处理失败，请重试";
+        }
+      });
+
+      // 处理单个批量图像
+
+      async function processBatchImage(file, current, total) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+
+          reader.onload = async (event) => {
+            try {
+              const img = new Image();
+
+              img.onload = async () => {
+                try {
+                  // 创建临时画布
+
+                  const tempInputCanvas = document.createElement("canvas");
+
+                  const tempOutputCanvas = document.createElement("canvas");
+
+                  tempInputCanvas.width = img.width;
+
+                  tempInputCanvas.height = img.height;
+
+                  tempOutputCanvas.width = img.width;
+
+                  tempOutputCanvas.height = img.height;
+
+                  // 绘制原始图像
+
+                  const inputCtx = tempInputCanvas.getContext("2d");
+
+                  inputCtx.drawImage(img, 0, 0);
+
+                  // 执行分割
+
+                  await processImage(tempInputCanvas, tempOutputCanvas);
+
+                  // 保存结果
+
+                  const resultDataURL = tempOutputCanvas.toDataURL("image/png");
+
+                  // 添加到处理后的图像列表
+
+                  processedImages.push({
+                    name: file.name,
+
+                    originalFile: file,
+
+                    resultDataURL: resultDataURL,
+                  });
+
+                  // 添加到结果显示区域
+
+                  addResultItem(file.name, resultDataURL);
+
+                  resolve();
+                } catch (error) {
+                  console.error(`处理图像 ${file.name} 时出错:`, error);
+
+                  reject(error);
+                }
+              };
+
+              img.onerror = () => {
+                reject(new Error(`无法加载图像: ${file.name}`));
+              };
+
+              img.src = event.target.result;
+            } catch (error) {
+              reject(error);
+            }
+          };
+
+          reader.onerror = () => {
+            reject(new Error(`无法读取文件: ${file.name}`));
+          };
+
+          reader.readAsDataURL(file);
+        });
+      }
+
+      // 添加单个结果项到界面
+
+      function addResultItem(name, resultDataURL) {
+        const resultItem = document.createElement("div");
+
+        resultItem.className = "result-item";
+
+        const resultImage = document.createElement("img");
+
+        resultImage.src = resultDataURL;
+
+        resultImage.alt = name;
+
+        const resultInfo = document.createElement("div");
+
+        resultInfo.className = "result-info";
+
+        resultInfo.innerHTML = `<strong>${name}</strong>`;
+
+        const resultActions = document.createElement("div");
+
+        resultActions.className = "result-actions";
+
+        const downloadButton = document.createElement("button");
+
+        downloadButton.textContent = "下载";
+
+        downloadButton.addEventListener("click", () => {
+          downloadImage(
+            resultDataURL,
+            name.replace(/\.[^/.]+$/, "") + "_segmented.png"
+          );
+        });
+
+        resultActions.appendChild(downloadButton);
+
+        resultItem.appendChild(resultImage);
+
+        resultItem.appendChild(resultInfo);
+
+        resultItem.appendChild(resultActions);
+
+        batchResults.appendChild(resultItem);
+      }
+
+      // 核心图像处理函数
+
+      async function processImage(inputCanvas, outputCanvas) {
+        // 获取输入图像数据
+
+        const inputCtx = inputCanvas.getContext("2d");
+
+        const imageData = inputCtx.getImageData(
+          0,
+
+          0,
+
+          inputCanvas.width,
+
+          inputCanvas.height
+        );
+
+        // 预处理图像
+
+        const tensor = tf.browser
+
+          .fromPixels(imageData)
+
+          .expandDims(0) // 添加批次维度
+
+          .div(255.0); // 归一化
+
+        // 调整大小为模型输入尺寸 (根据新图为 1x3x256x144)
+
+        let resized = tf.image.resizeBilinear(tensor, [256, 144]);
+
+        // 将输入从NHWC格式 [1,256,144,3] 转换为NCHW格式 [1,3,256,144]
+
+        const transposed = tf.transpose(resized, [0, 3, 1, 2]);
+
+        // 运行模型预测
+
+        console.log("运行模型预测...");
+
+        console.log("输入形状:", transposed.shape);
+
+        const predictions = await model.predict(transposed);
+
+        console.log("输出形状:", predictions.shape);
+
+        // 处理预测结果 - 根据模型输出形状进行适当处理
+
+        let segmentationMap = predictions;
+
+        // 检查输出维度
+
+        console.log("分割图形状:", segmentationMap.shape);
+
+        // 根据实际输出形状处理前景概率
+
+        let foregroundProbs;
+
+        // 检查输出形状，并相应地处理
+
+        if (segmentationMap.shape.length === 3) {
+          // 如果输出是 [1, H, W] 形状
+
+          foregroundProbs = segmentationMap.squeeze(); // 去除批次维度，变成 [H, W]
+        } else if (segmentationMap.shape.length === 4) {
+          // 如果输出是 [1, C, H, W] 形状
+
+          // 假设第一个通道包含前景概率
+
+          foregroundProbs = segmentationMap.slice(
+            [0, 0],
+
+            [1, 1, segmentationMap.shape[2], segmentationMap.shape[3]]
+          );
+
+          foregroundProbs = foregroundProbs.reshape([
+            segmentationMap.shape[2],
+
+            segmentationMap.shape[3],
+          ]);
+        } else {
+          throw new Error("无法处理的模型输出形状: " + segmentationMap.shape);
+        }
+
+        console.log("前景概率图形状:", foregroundProbs.shape);
+
+        // 如果形状与画布不匹配，调整大小
+
+        if (
+          foregroundProbs.shape[0] !== inputCanvas.height ||
+          foregroundProbs.shape[1] !== inputCanvas.width
+        ) {
+          // 为resizeBilinear添加必要的维度
+
+          foregroundProbs = tf.image
+
+            .resizeBilinear(
+              foregroundProbs.expandDims(-1), // 添加通道维度
+
+              [inputCanvas.height, inputCanvas.width]
+            )
+
+            .squeeze(-1); // 移除通道维度
+        }
+
+        // 应用阈值
+
+        const thresholded = foregroundProbs.greater(threshold);
+
+        console.log("阈值处理后形状:", thresholded.shape);
+
+        // 处理分割掩码
+
+        const mask = await thresholded.toInt().arraySync();
+
+        // 验证掩码尺寸
+
+        console.log(
+          "掩码尺寸:",
+
+          mask.length,
+
+          "x",
+
+          mask[0] ? mask[0].length : 0
+        );
+
+        console.log("画布尺寸:", inputCanvas.height, "x", inputCanvas.width);
+
+        if (
+          mask.length !== inputCanvas.height ||
+          mask[0].length !== inputCanvas.width
+        ) {
+          console.error("警告: 掩码尺寸与画布不匹配");
+        }
+
+        // 绘制分割结果
+
+        const outputCtx = outputCanvas.getContext("2d");
+
+        const segmentationImageData = outputCtx.createImageData(
+          inputCanvas.width,
+
+          inputCanvas.height
+        );
+
+        const data = segmentationImageData.data;
+
+        // 将原始图像复制到分割结果画布
+
+        outputCtx.drawImage(inputCanvas, 0, 0);
+
+        const originalData = outputCtx.getImageData(
+          0,
+
+          0,
+
+          outputCanvas.width,
+
+          outputCanvas.height
+        );
+
+        // 应用颜色mask到原始图像
+
+        for (let i = 0; i < mask.length; i++) {
+          for (let j = 0; j < (mask[i] ? mask[i].length : 0); j++) {
+            const pixelIndex = (i * outputCanvas.width + j) * 4;
+
+            if (mask[i][j] === 1) {
+              // 前景: 保持原图像素
+
+              data[pixelIndex] = originalData.data[pixelIndex];
+
+              data[pixelIndex + 1] = originalData.data[pixelIndex + 1];
+
+              data[pixelIndex + 2] = originalData.data[pixelIndex + 2];
+
+              data[pixelIndex + 3] = originalData.data[pixelIndex + 3];
+            } else {
+              // 背景: 保持原样
+
+              data[pixelIndex] = originalData.data[pixelIndex];
+
+              data[pixelIndex + 1] = originalData.data[pixelIndex + 1];
+
+              data[pixelIndex + 2] = originalData.data[pixelIndex + 2];
+
+              data[pixelIndex + 3] = originalData.data[pixelIndex + 3];
+            }
+          }
+        }
+
+        // 将结果绘制到输出画布
+
+        outputCtx.putImageData(segmentationImageData, 0, 0);
+
+        // 只在分割出的物体（前景）上添加蓝色遮罩
+
+        outputCtx.globalCompositeOperation = "multiply";
+
+        outputCtx.fillStyle = "rgba(255, 0, 0, 0.5)";
+
+        for (let i = 0; i < mask.length; i++) {
+          for (let j = 0; j < (mask[i] ? mask[i].length : 0); j++) {
+            if (mask[i][j] === 1) {
+              outputCtx.fillRect(j, i, 1, 1);
+            }
+          }
+        }
+
+        outputCtx.globalCompositeOperation = "source-over";
+
+        // 清理内存
+
+        tensor.dispose();
+
+        resized.dispose();
+
+        transposed.dispose();
+
+        predictions.dispose();
+
+        segmentationMap.dispose();
+
+        foregroundProbs.dispose();
+
+        thresholded.dispose();
+
+        console.log("分割完成");
+      }
+
+      // 下载单个图像结果
+
+      downloadSingleResult.addEventListener("click", () => {
+        if (outputCanvas.width === 0) {
+          alert("请先处理图像");
+
+          return;
+        }
+
+        // 获取图像名称（如果有的话）
+
+        let imageName = "segmented_image.png";
+
+        if (imageUpload.files && imageUpload.files[0]) {
+          imageName =
+            imageUpload.files[0].name.replace(/\.[^/.]+$/, "") +
+            "_segmented.png";
+        }
+
+        // 下载图像
+
+        const dataURL = outputCanvas.toDataURL("image/png");
+
+        downloadImage(dataURL, imageName);
+      });
+
+      // 下载打包所有结果
+
+      downloadAllButton.addEventListener("click", async () => {
+        if (processedImages.length === 0) {
+          alert("没有处理过的图像");
+
+          return;
+        }
+
+        try {
+          batchStatus.textContent = "正在打包所有结果...";
+
+          // 创建一个新的JSZip实例
+
+          const zip = new JSZip();
+
+          // 添加所有图像到压缩包
+
+          processedImages.forEach((img) => {
+            // 从DataURL中提取base64数据
+
+            const base64Data = img.resultDataURL.split(",")[1];
+
+            // 添加到zip
+
+            const filename =
+              img.name.replace(/\.[^/.]+$/, "") + "_segmented.png";
+
+            zip.file(filename, base64Data, { base64: true });
+          });
+
+          // 生成压缩包
+
+          const content = await zip.generateAsync({ type: "blob" });
+
+          // 创建下载链接
+
+          const url = URL.createObjectURL(content);
+
+          const link = document.createElement("a");
+
+          link.href = url;
+
+          link.download = "segmented_images.zip";
+
+          document.body.appendChild(link);
+
+          link.click();
+
+          document.body.removeChild(link);
+
+          batchStatus.textContent = "下载已开始，批处理完成！";
+        } catch (error) {
+          console.error("打包下载失败:", error);
+
+          alert("打包下载失败，请检查控制台获取详细信息");
+
+          batchStatus.textContent = "打包下载失败";
+        }
+      });
+
+      // 通用下载图像函数
+
+      function downloadImage(dataURL, filename) {
+        const link = document.createElement("a");
+
+        link.href = dataURL;
+
+        link.download = filename;
+
+        document.body.appendChild(link);
+
+        link.click();
+
+        document.body.removeChild(link);
+      }
+
+      // 页面加载完成后初始化
+
+      window.addEventListener("DOMContentLoaded", init);
+    </script>
+  </body>
+</html>
