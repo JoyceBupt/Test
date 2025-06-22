@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ONNX 模型 mIoU 和性能评测</title>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      margin: 2em;
+      background-color: #f9f9f9;
+      color: #333;
+    }
+
+    h1 {
+      text-align: center;
+      color: #111;
+    }
+
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      background: #fff;
+      padding: 2em;
+      box-shadow: 0 0 10px rgba(0, 0, 0, 0.05);
+      border-radius: 8px;
+    }
+
+    button {
+      display: block;
+      width: 100%;
+      padding: 1em;
+      font-size: 1em;
+      background-color: #007bff;
+      color: white;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      margin-bottom: 1em;
+      transition: background-color 0.3s;
+    }
+
+    button:disabled {
+      background-color: #cccccc;
+      cursor: not-allowed;
+    }
+
+    button:hover:not(:disabled) {
+      background-color: #0056b3;
+    }
+
+    #results table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 1em;
+    }
+
+    #results th,
+    #results td {
+      border: 1px solid #ddd;
+      padding: 12px;
+      text-align: left;
+    }
+
+    #results th {
+      background-color: #f2f2f2;
+    }
+
+    #progress-bar-container {
+      width: 100%;
+      background-color: #e0e0e0;
+      border-radius: 5px;
+      margin-bottom: 1em;
+    }
+
+    #progress-bar {
+      width: 0%;
+      height: 24px;
+      background-color: #4caf50;
+      border-radius: 5px;
+      text-align: center;
+      line-height: 24px;
+      color: white;
+      transition: width 0.4s ease;
+    }
+
+    .log-container {
+      margin-top: 1em;
+      padding: 1em;
+      background: #222;
+      color: #eee;
+      border-radius: 5px;
+      font-family: "Courier New", Courier, monospace;
+      height: 200px;
+      overflow-y: scroll;
+    }
+
+    .log-container p {
+      margin: 0;
+      padding: 0;
+      line-height: 1.5;
+    }
+
+    .controls {
+      margin-bottom: 1.5em;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+  </style>
+</head>
+
+<body>
+
+  <div class="container">
+    <h1>ONNX 模型 mIoU 和性能评测</h1>
+
+    <div class="controls">
+      <label for="threshold-input">分割阈值:</label>
+      <input type="number" id="threshold-input" value="0.5" step="0.05" min="0" max="1" style="width: 70px;">
+      <button id="run-button" onclick="runEvaluation()">开始评测</button>
+    </div>
+
+    <div id="progress-bar-container">
+      <div id="progress-bar">0%</div>
+    </div>
+
+    <div id="results">
+      <table id="results-table">
+        <thead>
+          <tr>
+            <th>图片名称</th>
+            <th>IoU (背景)</th>
+            <th>IoU (前景)</th>
+            <th>推理时间 (ms)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <!-- 结果将动态添加到这里 -->
+        </tbody>
+      </table>
+    </div>
+
+    <div id="summary-results"
+      style="display: none; margin-top: 1.5em; padding: 1em; background-color: #e8f5e9; border-radius: 5px;">
+      <h2>评测总结</h2>
+      <p><strong>模型:</strong> <span id="summary-model-name"></span></p>
+      <p><strong>推理后端:</strong> <span id="summary-backend"></span></p>
+      <p><strong>分割阈值:</strong> <span id="summary-threshold"></span></p>
+      <p><strong>最终 mIoU:</strong> <span id="summary-miou"></span></p>
+      <p><strong>平均推理时间:</strong> <span id="summary-avg-time"></span> ms</p>
+    </div>
+
+    <div class="log-container" id="log-output">
+      <p>请点击 "开始评测" 来启动...</p>
+    </div>
+  </div>
+
+  <script>
+    // --- 配置区域 ---
+
+    // !!重要!!: 请在此处配置您要测试的单个模型
+    const MODEL_PATH = 'models/ddrnet23.onnx';
+    const MODEL_INPUT_WIDTH = 144;
+    const MODEL_INPUT_HEIGHT = 256;
+
+    // 数据集文件列表 (这里我们只列出文件名, 扩展名将在代码中处理)
+    // 假设 'frames' 文件夹中的 .jpg 文件和 'masks_binary' 中的 .png 文件名一一对应
+    const IMAGE_FILES = [
+      '00000', '00001', '00002', '00003', '00004', '00005', '00006', '00007', '00008', '00009',
+      '00010', '00011', '00012', '00013', '00014', '00015', '00016', '00017', '00018', '00019',
+      '00020', '00021', '00022', '00023', '00024', '00025', '00026', '00027', '00028', '00029',
+      '00030', '00031', '00032', '00033', '00034', '00035', '00036', '00037', '00038', '00039',
+      '00040', '00041', '00042', '00043', '00044', '00045', '00046', '00047', '00048', '00049',
+      '00050', '00051', '00052', '00053', '00054', '00055', '00056', '00057', '00058', '00059',
+      '00060', '00061', '00062', '00063', '00064', '00065', '00066', '00067', '00068', '00069',
+      '00070', '00071', '00072', '00073', '00074', '00075', '00076', '00077', '00078', '00079',
+      '00080', '00081', '00082', '00083', '00084', '00085', '00086', '00087', '00088', '00089',
+      '00090', '00091', '00092', '00093', '00094', '00095', '00096', '00097', '00098', '00099',
+      '00100', '00101', '00102', '00103', '00104', '00105', '00106', '00107', '00108', '00109',
+      '00110', '00111', '00112', '00113', '00114', '00115', '00116', '00117', '00118', '00119',
+      '00120', '00121', '00122', '00123', '00124', '00125', '00126', '00127', '00128', '00129',
+      '00130', '00131', '00132', '00133', '00134', '00135', '00136', '00137', '00138', '00139',
+      '00140', '00141', '00142', '00143', '00144', '00145', '00146', '00147', '00148', '00149',
+      '00150', '00151', '00152', '00153', '00154', '00155', '00156', '00157', '00158', '00159',
+      '00160', '00161', '00162', '00163', '00164', '00165', '00166', '00167', '00168', '00169',
+      '00170', '00171', '00172', '00173', '00174', '00175', '00176', '00177', '00178', '00179'
+    ];
+    const IMAGE_DIR = 'datasets/frames';
+    const MASK_DIR = 'datasets/masks_binary';
+
+    // --- 全局变量 ---
+    const runButton = document.getElementById('run-button');
+    const resultsBody = document.getElementById('results-table').getElementsByTagName('tbody')[0];
+    const progressBar = document.getElementById('progress-bar');
+    const logOutput = document.getElementById('log-output');
+    const summaryDiv = document.getElementById('summary-results');
+    const thresholdInput = document.getElementById('threshold-input');
+
+    // --- 日志和UI更新函数 ---
+    function log(message) {
+      console.log(message);
+      const p = document.createElement('p');
+      p.textContent = `> ${message}`;
+      logOutput.appendChild(p);
+      logOutput.scrollTop = logOutput.scrollHeight;
+    }
+
+    function updateProgress(value) {
+      const percentage = Math.round(value * 100);
+      progressBar.style.width = percentage + '%';
+      progressBar.textContent = percentage + '%';
+    }
+
+    function addResultRow(imageName, ious, inferenceTime) {
+      const newRow = resultsBody.insertRow();
+      newRow.insertCell(0).textContent = imageName;
+      newRow.insertCell(1).textContent = ious[0].toFixed(4);
+      newRow.insertCell(2).textContent = ious[1].toFixed(4);
+      newRow.insertCell(3).textContent = inferenceTime.toFixed(2);
+    }
+
+    // --- 核心评测逻辑 ---
+
+    async function runEvaluation() {
+      runButton.disabled = true;
+      resultsBody.innerHTML = ''; // 清除旧的表格行
+      summaryDiv.style.display = 'none'; // 隐藏旧的总结
+      log('评测开始...');
+
+      const totalSteps = IMAGE_FILES.length;
+      let currentStep = 0;
+      const threshold = parseFloat(thresholdInput.value);
+
+      const modelConfig = { width: MODEL_INPUT_WIDTH, height: MODEL_INPUT_HEIGHT };
+
+      log(`正在加载模型: ${MODEL_PATH} (输入尺寸: ${modelConfig.width}x${modelConfig.height})...`);
+
+      let session;
+      let backend = 'unknown'; // Default value
+
+      try {
+        log('尝试使用 WebGL 后端...');
+        session = await ort.InferenceSession.create(MODEL_PATH, { executionProviders: ['webgl'] });
+        backend = 'webgl';
+        log('WebGL 后端加载成功.');
+      } catch (webglError) {
+        log(`WebGL 后端不可用, 回退到 WASM. (${webglError.message})`);
+        try {
+          session = await ort.InferenceSession.create(MODEL_PATH, { executionProviders: ['wasm'] });
+          backend = 'wasm';
+          log('WASM 后端加载成功.');
+        } catch (wasmError) {
+          log(`错误: 所有后端 (WebGL, WASM) 都加载失败. ${wasmError}`);
+          summaryDiv.style.display = 'block';
+          document.getElementById('summary-model-name').textContent = MODEL_PATH.split('/').pop();
+          document.getElementById('summary-backend').textContent = '加载失败';
+          document.getElementById('summary-threshold').textContent = threshold;
+          document.getElementById('summary-miou').textContent = '评测失败';
+          document.getElementById('summary-avg-time').textContent = 'N/A';
+          runButton.disabled = false;
+          return; // 结束执行
+        }
+      }
+
+      log(`使用推理后端: ${backend}`);
+
+      const allIouBgs = [];
+      const allIouFgs = [];
+      const allInferenceTimes = [];
+      let errorCount = 0;
+
+      for (const imageBaseName of IMAGE_FILES) {
+        const imagePath = `${IMAGE_DIR}/${imageBaseName}.jpg`;
+        const maskPath = `${MASK_DIR}/${imageBaseName}.png`;
+
+        try {
+          // 1. 预处理和推理
+          const { outputTensor, inferenceTime } = await runInference(session, imagePath, modelConfig);
+
+          // 2. 加载真值Mask
+          const gtMask = await loadGroundTruthMask(maskPath, modelConfig);
+
+          // 3. 后处理和计算IoU
+          const ious = calculateIoU(outputTensor, gtMask, threshold);
+
+          // 4. 实时添加结果行并累计数据
+          addResultRow(`${imageBaseName}.jpg`, ious, inferenceTime);
+          allIouBgs.push(ious[0]);
+          allIouFgs.push(ious[1]);
+          allInferenceTimes.push(inferenceTime);
+
+        } catch (e) {
+          log(`处理图片 ${imageBaseName} 时出错: ${e}`);
+          addResultRow(`${imageBaseName}.jpg`, [NaN, NaN], NaN);
+          errorCount++;
+        }
+
+        currentStep++;
+        updateProgress(currentStep / totalSteps);
+      }
+
+      // --- 计算并显示最终总结 ---
+      const numImagesProcessed = IMAGE_FILES.length - errorCount;
+      const avgTime = numImagesProcessed > 0
+        ? allInferenceTimes.reduce((a, b) => a + b, 0) / numImagesProcessed
+        : 0;
+
+      let mIoU = NaN;
+      if (allIouBgs.length > 0 && allIouFgs.length > 0) {
+        const meanIoU_bg = allIouBgs.reduce((a, b) => a + b, 0) / allIouBgs.length;
+        const meanIoU_fg = allIouFgs.reduce((a, b) => a + b, 0) / allIouFgs.length;
+        mIoU = (meanIoU_bg + meanIoU_fg) / 2;
+      }
+
+      document.getElementById('summary-model-name').textContent = MODEL_PATH.split('/').pop();
+      document.getElementById('summary-backend').textContent = backend;
+      document.getElementById('summary-threshold').textContent = threshold;
+      document.getElementById('summary-miou').textContent = isNaN(mIoU) ? 'N/A' : mIoU.toFixed(4);
+      document.getElementById('summary-avg-time').textContent = avgTime.toFixed(2);
+      summaryDiv.style.display = 'block';
+
+      log('评测已完成!');
+      runButton.disabled = false;
+    }
+
+    async function runInference(session, imagePath, modelConfig) {
+      // 加载并预处理图片
+      const imageTensor = await preprocessImage(imagePath, modelConfig);
+
+      const inputName = session.inputNames[0];
+      const feeds = { [inputName]: imageTensor };
+
+      // 执行推理并计时
+      const startTime = performance.now();
+      const results = await session.run(feeds);
+      const endTime = performance.now();
+
+      const outputName = session.outputNames[0];
+      return {
+        outputTensor: results[outputName],
+        inferenceTime: endTime - startTime
+      };
+    }
+
+    function preprocessImage(imagePath, modelConfig) {
+      const { width: modelWidth, height: modelHeight } = modelConfig;
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = "anonymous";
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          canvas.width = modelWidth;
+          canvas.height = modelHeight;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, modelWidth, modelHeight);
+          const imageData = ctx.getImageData(0, 0, modelWidth, modelHeight);
+
+          const { data } = imageData;
+          const float32Data = new Float32Array(1 * 3 * modelWidth * modelHeight);
+
+          for (let i = 0; i < modelWidth * modelHeight; i++) {
+            float32Data[i] = data[i * 4] / 255.0;           // R
+            float32Data[i + modelWidth * modelHeight] = data[i * 4 + 1] / 255.0; // G
+            float32Data[i + 2 * modelWidth * modelHeight] = data[i * 4 + 2] / 255.0; // B
+          }
+
+          const tensor = new ort.Tensor('float32', float32Data, [1, 3, modelHeight, modelWidth]);
+          resolve(tensor);
+        };
+        img.onerror = reject;
+        img.src = imagePath;
+      });
+    }
+
+    function loadGroundTruthMask(maskPath, modelConfig) {
+      const { width: modelWidth, height: modelHeight } = modelConfig;
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = "anonymous";
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          canvas.width = modelWidth;
+          canvas.height = modelHeight;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, modelWidth, modelHeight);
+          const imageData = ctx.getImageData(0, 0, modelWidth, modelHeight);
+
+          // Mask是单通道的，我们只取R通道的值 (假设前景是1, 在png里会是[1,1,1,255]或类似)
+          // 乘以255是因为标注图里前景是1, 背景是0, 读进来之后会是(1,1,1,255)和(0,0,0,255),
+          // 但有些工具保存的可能是(255,255,255,255)和(0,0,0,255), 这里做个归一化
+          const maskData = new Uint8Array(modelWidth * modelHeight);
+          for (let i = 0; i < imageData.data.length; i += 4) {
+            maskData[i / 4] = imageData.data[i] > 0 ? 1 : 0;
+          }
+          resolve(maskData);
+        };
+        img.onerror = reject;
+        img.src = maskPath;
+      });
+    }
+
+    function calculateIoU(predTensor, gtMask, threshold) {
+      const predData = predTensor.data;
+      const [_, numClasses, height, width] = predTensor.dims;
+
+      if (numClasses !== 2) {
+        throw new Error(`模型输出通道应为2, 但检测到 ${numClasses}`);
+      }
+
+      const predMask = new Uint8Array(height * width);
+      const classOffset = height * width;
+
+      // 后处理: Softmax + Threshold
+      for (let i = 0; i < classOffset; i++) {
+        const logitBg = predData[i];
+        const logitFg = predData[i + classOffset];
+
+        // 计算 Softmax
+        const maxLogit = Math.max(logitBg, logitFg);
+        const expBg = Math.exp(logitBg - maxLogit);
+        const expFg = Math.exp(logitFg - maxLogit);
+        const probFg = expFg / (expBg + expFg);
+
+        // 应用阈值
+        predMask[i] = probFg >= threshold ? 1 : 0;
+      }
+
+      const iou = [0, 0]; // bg, fg
+      const intersection = [0, 0];
+      const union = [0, 0];
+
+      for (let i = 0; i < gtMask.length; i++) {
+        const gt = gtMask[i];
+        const pred = predMask[i];
+
+        if (gt === pred) {
+          intersection[gt]++;
+        }
+        union[gt]++;
+        if (gt !== pred) {
+          union[pred]++;
+        }
+      }
+
+      // 计算每个类的IoU, 避免除以0
+      iou[0] = union[0] > 0 ? intersection[0] / union[0] : 1.0;
+      iou[1] = union[1] > 0 ? intersection[1] / union[1] : 1.0;
+
+      return iou;
+    }
+
+  </script>
+
+</body>
+
+</html>
